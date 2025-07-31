@@ -100,19 +100,40 @@ function normalizeSuffix(ascii: string) {
 /** Extract on-chain bytes (after “/storage”), trim dup “/”, drop “/length”. */
 function extractContractKeyHex(kbuf: Buffer): string {
   const marker = Buffer.from("/storage");
-  const i = kbuf.indexOf(marker);
-  if (i === -1) return toHex(kbuf); // fallback
+  const idx = kbuf.indexOf(marker);
+  if (idx === -1) return toHex(kbuf); // fallback
 
-  let tail = kbuf.slice(i + marker.length); // bytes after '/storage'
+  let tail = kbuf.slice(idx + marker.length); // bytes after "/storage"
 
-  if (tail[0] === 0x2f && tail[1] === 0x2f) tail = tail.slice(1); // remove extra '/'
+  // remove extra leading '/' if we had "//"
+  if (tail.length >= 2 && tail[0] === 0x2f && tail[1] === 0x2f)
+    tail = tail.slice(1);
+
+  // strip trailing "/length"
   const lenTag = Buffer.from("/length");
-  if (tail.slice(-lenTag.length).equals(lenTag))
+  if (
+    tail.length >= lenTag.length &&
+    tail.slice(-lenTag.length).equals(lenTag)
+  ) {
     tail = tail.slice(0, -lenTag.length);
+  }
+
+  // strip trailing "/<digits>"
+  const lastSlash = tail.lastIndexOf(0x2f);
+  if (lastSlash !== -1 && lastSlash < tail.length - 1) {
+    let digitsOnly = true;
+    for (let i = lastSlash + 1; i < tail.length; i++) {
+      const c = tail[i];
+      if (c < 0x30 || c > 0x39) {
+        digitsOnly = false;
+        break;
+      }
+    }
+    if (digitsOnly) tail = tail.slice(0, lastSlash);
+  }
 
   return toHex(tail);
 }
-
 function decodeVal(buf: Buffer) {
   if (isPrint(buf)) {
     const text = toAscii(buf);
