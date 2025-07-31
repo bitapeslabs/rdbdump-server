@@ -17,8 +17,7 @@
 //   CHILD_TIMEOUT_MS  – per-process limit  (default 120 000 ms)
 // ---------------------------------------------------------------------------
 // CHANGELOG
-// • 2025-07-31 – added `contractKeyHex` (raw on-chain bytes **after** “/storage”,
-//                duplicate leading slash trimmed, trailing “/length” removed).
+// • 2025-07-31 – added `contractKeyHex` per record.
 // ---------------------------------------------------------------------------
 
 import express from "express";
@@ -28,7 +27,7 @@ import os from "node:os";
 import path from "node:path";
 import "dotenv/config";
 
-/* ──────────────── config ──────────────── */
+/* ───── config ───── */
 const DB_PATH = process.env.DB_PATH ?? "/data/.metashrew/mainnet";
 const AUTH_TOKEN = process.env.AUTH_TOKEN ?? "";
 const LDB_BIN = process.env.LDB_BIN ?? "ldb";
@@ -39,11 +38,10 @@ const DEFAULT_ENDIAN =
 const PORT = Number(process.env.PORT ?? 7107);
 const CHILD_TIMEOUT = Number(process.env.CHILD_TIMEOUT_MS ?? 120_000);
 
-if (!AUTH_TOKEN) {
-  console.warn("[WARN] AUTH_TOKEN is empty – endpoint is unauthenticated!");
-}
+if (!AUTH_TOKEN)
+  console.warn("[WARN] AUTH_TOKEN is empty – endpoint is public!");
 
-/* ──────────────── helpers ──────────────── */
+/* ───── helpers ───── */
 const toHex = (b: Buffer) => "0x" + b.toString("hex");
 const fromHex = (h: string) => Buffer.from(h.replace(/^0x/i, ""), "hex");
 const isPrint = (b: Buffer) =>
@@ -59,24 +57,25 @@ const pretty = (b: Buffer) =>
     .join("");
 
 function u128le(n: bigint) {
-  const buf = Buffer.alloc(16);
+  const b = Buffer.alloc(16);
   for (let i = 0; i < 16; i++) {
-    buf[i] = Number(n & 0xffn);
+    b[i] = Number(n & 0xffn);
     n >>= 8n;
   }
-  return buf;
+  return b;
 }
 function u128be(n: bigint) {
-  const buf = Buffer.alloc(16);
+  const b = Buffer.alloc(16);
   for (let i = 15; i >= 0; i--) {
-    buf[i] = Number(n & 0xffn);
+    b[i] = Number(n & 0xffn);
     n >>= 8n;
   }
-  return buf;
+  return b;
 }
+
 function parseAlkaneId(str: string): [bigint, bigint] {
   const m = str.match(/^(\d+):(\d+)$/);
-  if (!m) throw new Error("AlkaneId must be 'A:B' (decimal u128)");
+  if (!m) throw new Error("AlkaneId must be A:B (decimal u128)");
   return [BigInt(m[1]), BigInt(m[2])];
 }
 function makePrefix(id: string, endian: "le" | "be") {
@@ -89,25 +88,31 @@ function makePrefix(id: string, endian: "le" | "be") {
     Buffer.from("/storage"),
   ]);
 }
-function normalizeSuffix(keyAscii: string) {
-  const i = keyAscii.indexOf("/storage");
-  let s = i >= 0 ? keyAscii.slice(i + "/storage".length) : keyAscii;
+
+function normalizeSuffix(ascii: string) {
+  const i = ascii.indexOf("/storage");
+  let s = i >= 0 ? ascii.slice(i + "/storage".length) : ascii;
   if (s.startsWith("//")) s = s.slice(1);
   if (!s.startsWith("/")) s = "/" + s;
   return s;
 }
-/** raw bytes after `/storage`, dup “/” trimmed, trailing “/length” stripped */
-function contractKeyHex(kbuf: Buffer) {
+
+/** Extract on-chain bytes (after “/storage”), trim dup “/”, drop “/length”. */
+function extractContractKeyHex(kbuf: Buffer): string {
   const marker = Buffer.from("/storage");
   const i = kbuf.indexOf(marker);
-  if (i === -1) return toHex(kbuf);
-  let tail = kbuf.slice(i + marker.length);
-  if (tail[0] === 0x2f && tail[1] === 0x2f) tail = tail.slice(1); // drop duplicate '/'
+  if (i === -1) return toHex(kbuf); // fallback
+
+  let tail = kbuf.slice(i + marker.length); // bytes after '/storage'
+
+  if (tail[0] === 0x2f && tail[1] === 0x2f) tail = tail.slice(1); // remove extra '/'
   const lenTag = Buffer.from("/length");
   if (tail.slice(-lenTag.length).equals(lenTag))
     tail = tail.slice(0, -lenTag.length);
+
   return toHex(tail);
 }
+
 function decodeVal(buf: Buffer) {
   if (isPrint(buf)) {
     const text = toAscii(buf);
@@ -118,15 +123,16 @@ function decodeVal(buf: Buffer) {
   return { hex: toHex(buf) };
 }
 
-/* ──────────────── parsers ──────────────── */
-const KV_RE = /(0x[0-9a-fA-F]+)\s*={1,2}>\s*(0x[0-9a-fA-F]+)/; // supports '=>' and '==>'
-function parseLdb(out: string) {
-  return out.split(/\r?\n/).flatMap((line) => {
-    const m = line.match(KV_RE);
+/* ───── parsers ───── */
+const KV_RE = /(0x[0-9a-fA-F]+)\s*={1,2}>\s*(0x[0-9a-fA-F]+)/; // '=>' or '==>'
+
+const parseLdb = (out: string) =>
+  out.split(/\r?\n/).flatMap((l) => {
+    const m = l.match(KV_RE);
     return m ? [{ kbuf: fromHex(m[1]), vbuf: fromHex(m[2]) }] : [];
   });
-}
-function parseSst(out: string) {
+
+const parseSst = (out: string) => {
   const re = /^0x([0-9a-fA-F]+)\s+@\s+\d+:\s+\d+\s+={1,2}>\s+0x([0-9a-fA-F]+)$/;
   return out.split(/\r?\n/).flatMap((l) => {
     const m = l.match(re);
@@ -134,9 +140,9 @@ function parseSst(out: string) {
       ? [{ kbuf: Buffer.from(m[1], "hex"), vbuf: Buffer.from(m[2], "hex") }]
       : [];
   });
-}
+};
 
-/* ──────────────── child runner ──────────────── */
+/* ───── child ───── */
 function run(cmd: string, args: string[]) {
   return new Promise<string>((res, rej) => {
     const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -151,18 +157,16 @@ function run(cmd: string, args: string[]) {
     p.on("error", rej);
     p.on("close", (c) => {
       clearTimeout(t);
-      c === 0
-        ? res(out)
-        : rej(new Error(`${cmd} ${args.join(" ")} => ${c}: ${err}`));
+      c === 0 ? res(out) : rej(new Error(`${cmd}=>${c}: ${err}`));
     });
   });
 }
 
-/* ──────────────── dump core ──────────────── */
+/* ───── dump core ───── */
 async function dump(id: string, endian: "le" | "be") {
   const pref = makePrefix(id, endian);
-  const fromH = toHex(pref);
-  const toH = toHex(Buffer.concat([pref, Buffer.from([0xff])]));
+  const from = toHex(pref);
+  const to = toHex(Buffer.concat([pref, Buffer.from([0xff])]));
 
   const sec = fs.mkdtempSync(path.join(os.tmpdir(), "ldb_sec_"));
   const ldbArgs = (keyHex: boolean) => [
@@ -172,51 +176,50 @@ async function dump(id: string, endian: "le" | "be") {
     `--column_family=${COLUMN_FAMILY}`,
     "scan",
     ...(keyHex ? ["--key_hex"] : []),
-    `--from=${fromH}`,
-    `--to=${toH}`,
+    `--from=${from}`,
+    `--to=${to}`,
     "--hex",
   ];
 
   try {
-    const out1 = await run(LDB_BIN, ldbArgs(false));
-    const r1 = parseLdb(out1);
+    const o1 = await run(LDB_BIN, ldbArgs(false));
+    const r1 = parseLdb(o1);
     if (r1.length) return r1;
   } catch {}
-
   try {
-    const out2 = await run(LDB_BIN, ldbArgs(true));
-    const r2 = parseLdb(out2);
+    const o2 = await run(LDB_BIN, ldbArgs(true));
+    const r2 = parseLdb(o2);
     if (r2.length) return r2;
   } catch {}
 
   const sstArgs = [
     `--file=${DB_PATH}`,
     "--command=scan",
-    `--from=${fromH}`,
-    `--to=${toH}`,
+    `--from=${from}`,
+    `--to=${to}`,
     "--input_key_hex",
     "--output_hex",
   ];
-  const out3 = await run(SST_DUMP_BIN, sstArgs);
-  return parseSst(out3);
+  const o3 = await run(SST_DUMP_BIN, sstArgs);
+  return parseSst(o3);
 }
-function aggregate(records: { kbuf: Buffer; vbuf: Buffer }[]) {
-  const list: any[] = [];
+
+function aggregate(rows: { kbuf: Buffer; vbuf: Buffer }[]) {
+  const records: any[] = [];
   const by: Record<string, any[]> = {};
   const latest: Record<string, any> = {};
 
-  for (const { kbuf, vbuf } of records) {
+  for (const { kbuf, vbuf } of rows) {
     const suffix = normalizeSuffix(toAscii(kbuf));
     const val = decodeVal(vbuf);
 
-    const rec = {
+    records.push({
       key: suffix,
-      contractKeyHex: contractKeyHex(kbuf),
+      contractKeyHex: extractContractKeyHex(kbuf),
       rawKey: { ascii: pretty(kbuf), hex: toHex(kbuf) },
       value: val,
       valueHex: toHex(vbuf),
-    };
-    list.push(rec);
+    });
 
     (by[suffix] ??= []).push(val);
     if (typeof val.block === "number") {
@@ -225,27 +228,27 @@ function aggregate(records: { kbuf: Buffer; vbuf: Buffer }[]) {
     }
   }
   return {
-    count: list.length,
-    records: list,
+    count: records.length,
+    records,
     bySuffix: by,
     latestBySuffix: latest,
   };
 }
 
-/* ──────────────── express ──────────────── */
+/* ───── express ───── */
 const app = express();
 app.set("x-powered-by", false);
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/health", (_, res) => res.json({ ok: true }));
 
 app.get("/dump/:alkaneId", async (req, res) => {
-  if (!AUTH_TOKEN || req.query.token !== AUTH_TOKEN) {
+  if (!AUTH_TOKEN || req.query.token !== AUTH_TOKEN)
     return res.status(401).json({ error: "unauthorized" });
-  }
+
   const id = req.params.alkaneId;
-  if (!/^\d+:\d+$/.test(id)) {
-    return res.status(400).json({ error: "invalid alkaneId (expect A:B)" });
-  }
+  if (!/^\d+:\d+$/.test(id))
+    return res.status(400).json({ error: "invalid alkaneId (A:B)" });
+
   try {
     const endian =
       (req.query.endian as string) === "be" ? "be" : DEFAULT_ENDIAN;
@@ -264,4 +267,4 @@ app.get("/dump/:alkaneId", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`alkane-dump server listening on :${PORT}`));
+app.listen(PORT, () => console.log(`alkane-dump listening on :${PORT}`));
